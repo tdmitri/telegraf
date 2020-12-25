@@ -90,11 +90,6 @@ namespace Telegraf {
   }
 }
 
-interface Task<C extends Context> {
-  ctx: C
-  webhookResponse?: http.ServerResponse
-}
-
 export class Telegraf<C extends Context = Context> extends Composer<C> {
   private readonly options: Telegraf.Options<C>
   private webhookServer?: http.Server | https.Server
@@ -103,7 +98,7 @@ export class Telegraf<C extends Context = Context> extends Composer<C> {
   public botInfo?: tt.UserFromGetMe
   public telegram: Telegram
   readonly context: Partial<C> = {}
-  private updateQueue: DecayingDeque<Task<C>> | undefined
+  private updateQueue: DecayingDeque<C> | undefined
 
   private handleError = async (err: unknown, ctx: C): Promise<void> => {
     // set exit code to emulate `warn-with-error-code` behavior of
@@ -162,24 +157,17 @@ export class Telegraf<C extends Context = Context> extends Composer<C> {
   webhookCallback(path = '/') {
     return generateCallback(
       path,
-      async (update: tt.Update, res: http.ServerResponse) => {
-        await this.handleUpdates([update], res)
-      },
+      (update: tt.Update, res: http.ServerResponse) =>
+        this.handleUpdate(update, res),
       debug
     )
   }
 
-  private startPolling(allowedUpdates: tt.UpdateType[] = [], timeout = 50) {
-    const polling = (this.polling = new Polling(
-      this.telegram,
-      allowedUpdates,
-      timeout
-    ))
+  private startPolling(allowedUpdates: tt.UpdateType[], timeout: number) {
+    this.polling = new Polling(this.telegram, allowedUpdates, timeout)
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    polling.loop(async (updates) => {
-      const capacity = await this.handleUpdates(updates)
-      // request at least 10 updates, or undefined (=100) if unknown
-      polling.limit = capacity === undefined || capacity > 10 ? capacity : 10
+    this.polling.loop(async (updates) => {
+      await this.handleUpdates(updates)
     })
   }
 
@@ -207,10 +195,12 @@ export class Telegraf<C extends Context = Context> extends Composer<C> {
   private initializeQueue(concurrency: boolean | number) {
     this.updateQueue ??= new DecayingDeque(
       this.options.handlerTimeout,
-      (t: Task<C>) => this.invokeMiddleware(t),
+      async (ctx: C) => {
+        await this.middleware()(ctx, anoop)
+      },
       concurrency,
-      (err: unknown, t: Task<C>) => this.handleError(err, t.ctx),
-      (t: Task<C>, p: Promise<void>) => this.handleTimeout(t.ctx, p)
+      (err: unknown, ctx: C) => this.handleError(err, ctx),
+      (ctx: C, p: Promise<void>) => this.handleTimeout(ctx, p)
     )
   }
 
@@ -222,7 +212,10 @@ export class Telegraf<C extends Context = Context> extends Composer<C> {
     debug(`Launching @${this.botInfo.username}`)
     if (config.webhook === undefined) {
       await this.telegram.deleteWebhook()
-      this.startPolling(config.allowedUpdates, config.polling?.timeout)
+      this.startPolling(
+        config.allowedUpdates ?? [],
+        config.polling?.timeout ?? 50
+      )
       debug('Bot started with long polling')
       return
     }
@@ -261,44 +254,34 @@ export class Telegraf<C extends Context = Context> extends Composer<C> {
     this.polling?.stop()
   }
 
-  async handleUpdate(update: tt.Update, webhookResponse?: http.ServerResponse) {
-    return await this.handleUpdates([update], webhookResponse)
-  }
-
-  private botInfoCall?: Promise<tt.UserFromGetMe>
-  private async handleUpdates(
-    updates: readonly tt.Update[],
-    webhookResponse?: http.ServerResponse
-  ) {
+  private handleUpdates(updates: readonly tt.Update[]) {
     if (!Array.isArray(updates)) {
       throw new TypeError(util.format('Updates must be an array, got', updates))
     }
-    const botInfo = (this.botInfo ??=
-      (debug(
-        'Updates are waiting for `botInfo` to be initialized:',
-        ...updates.map((u) => u.update_id)
-      ),
-      await (this.botInfoCall ??= this.telegram.getMe())))
-
-    const tasks: Array<Task<C>> = updates.map((update) => {
-      const tg = new Telegram(
-        this.token,
-        this.telegram.options,
-        webhookResponse
-      )
-      const TelegrafContext = this.options.contextType
-      const ctx = new TelegrafContext(update, tg, botInfo)
-      Object.assign(ctx, this.context)
-      return { ctx, webhookResponse }
-    })
-    return await this.updateQueue?.add(tasks)
+    return Promise.all(updates.map((update) => this.handleUpdate(update)))
   }
 
-  private async invokeMiddleware(t: Task<C>): Promise<void> {
+  private botInfoCall?: Promise<tt.UserFromGetMe>
+  async handleUpdate(update: tt.Update, webhookResponse?: http.ServerResponse) {
+    debug('Processing update', update.update_id)
+    this.botInfo ??=
+      (debug(
+        'Update',
+        update.update_id,
+        'is waiting for `botInfo` to be initialized'
+      ),
+      await (this.botInfoCall ??= this.telegram.getMe()))
+    const tg = new Telegram(this.token, this.telegram.options, webhookResponse)
+    const TelegrafContext = this.options.contextType
+    const ctx = new TelegrafContext(update, tg, this.botInfo)
+    Object.assign(ctx, this.context)
     try {
-      await this.middleware()(t.ctx, anoop)
+      await this.updateQueue?.add([ctx])
     } finally {
-      if (t.webhookResponse?.writableEnded === false) t.webhookResponse?.end()
+      // FIXME: does not work if concurrency > 1:
+      if (webhookResponse !== undefined && !webhookResponse.writableEnded) {
+        webhookResponse.end()
+      }
     }
   }
 }
